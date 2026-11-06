@@ -838,45 +838,119 @@ def _get_updated_ids(depsgraph):
             continue
         yield id_data
 
-# In depsgraph_update_pre, depsgraph.updates lists the IDs tagged for the coming evaluation (that
-# is how the edited ID is found before its new value is applied). But the depsgraph is only
-# rebuilt during that evaluation, so if IDs were deleted since the last update (Outliner delete,
-# purge, a script removing objects) their entries still point to freed memory, and reading them
-# crashes Blender. Deletions are detected by comparing the number of data-blocks of each type
-# with the last update; in that case the pre-update snapshot is skipped once. That update is the
-# deletion itself, so there is no user edit to offset in it.
-_ID_COLLECTION_NAMES = None
-_id_counts_at_last_update = None
+# depsgraph_update_pre must never read depsgraph.updates: before the evaluation it can still hold
+# entries for IDs deleted since the last update (Outliner/viewport delete, purge, scripts), whose
+# memory is already freed, and reading them crashes Blender. Which depsgraph was evaluated last
+# cannot be relied on either (several windows, view layers, add-on timers), so instead the
+# pre-update snapshot covers IDs taken from live data only:
+#   * the selected and active objects with their data, shape keys, materials and node trees,
+#     and the scene and its world: what the user edits in the viewport, N panel or Properties;
+#   * the IDs updated by the last update or frame change, remembered by name where reading
+#     depsgraph.updates is safe (post handlers) and looked up again, so deleted ones are skipped.
+_ID_COLLECTIONS = {
+    'OBJECT': 'objects', 'MESH': 'meshes', 'CURVE': 'curves', 'CURVES': 'hair_curves',
+    'POINTCLOUD': 'pointclouds', 'VOLUME': 'volumes', 'LATTICE': 'lattices', 'ARMATURE': 'armatures',
+    'KEY': 'shape_keys', 'MATERIAL': 'materials', 'TEXTURE': 'textures', 'WORLD': 'worlds',
+    'CAMERA': 'cameras', 'LIGHT': 'lights', 'LIGHT_PROBE': 'lightprobes', 'SPEAKER': 'speakers',
+    'NODETREE': 'node_groups', 'SCENE': 'scenes', 'PARTICLE': 'particles', 'METABALL': 'metaballs',
+    'GREASEPENCIL': 'grease_pencils', 'GREASEPENCIL_V3': 'grease_pencils', 'MOVIECLIP': 'movieclips',
+    'MASK': 'masks', 'CACHEFILE': 'cache_files', 'LINESTYLE': 'linestyles', 'PALETTE': 'palettes',
+}
+# Owners of embedded node trees (these are not in bpy.data.node_groups)
+_NODE_TREE_OWNERS = ('materials', 'worlds', 'lights', 'linestyles', 'textures', 'scenes')
 
-def _id_counts():
-    global _ID_COLLECTION_NAMES
-    if _ID_COLLECTION_NAMES is None:
-        _ID_COLLECTION_NAMES = tuple(
-            prop.identifier for prop in bpy.types.BlendData.bl_rna.properties
-            if prop.type == 'COLLECTION' and prop.identifier not in {'window_managers', 'workspaces', 'screens'})
-    return tuple(len(getattr(bpy.data, name)) for name in _ID_COLLECTION_NAMES)
+_last_updated_ids: list = []
 
-def _remember_id_counts():
-    global _id_counts_at_last_update
-    _id_counts_at_last_update = _id_counts()
+def _id_key(id_data):
+    """Name-based key to find an ID again later, or None."""
+    if getattr(id_data, 'is_embedded_data', False):
+        if id_data.id_type != 'NODETREE':
+            return None
+        for coll_name in _NODE_TREE_OWNERS:
+            for owner in getattr(bpy.data, coll_name, ()):
+                if getattr(owner, 'node_tree', None) == id_data:
+                    return ('EMBEDDED', coll_name, owner.name, owner.library.filepath if owner.library else None)
+        return None
+    coll_name = _ID_COLLECTIONS.get(id_data.id_type)
+    if coll_name is None:
+        return None
+    return ('ID', coll_name, id_data.name, id_data.library.filepath if id_data.library else None)
 
-def _ids_deleted_since_last_update():
-    if _id_counts_at_last_update is None:
-        return True
-    return any(now < before for now, before in zip(_id_counts(), _id_counts_at_last_update))
+def _resolve_key(key):
+    kind, coll_name, name, lib = key
+    coll = getattr(bpy.data, coll_name, None)
+    if coll is None:
+        return None
+    id_data = next((i for i in coll if i.name == name and
+                    (i.library.filepath if i.library else None) == lib), None) if lib else coll.get(name)
+    if id_data is not None and lib is None and id_data.library is not None:
+        id_data = next((i for i in coll if i.name == name and i.library is None), None)
+    if id_data is not None and kind == 'EMBEDDED':
+        id_data = getattr(id_data, 'node_tree', None)
+    return id_data
+
+def _remember_updated_ids(depsgraph):
+    """Only call where depsgraph.updates is safe to read (post handlers)."""
+    keys = []
+    for id_data in _get_updated_ids(depsgraph):
+        key = _id_key(id_data)
+        if key is not None:
+            keys.append(key)
+    _last_updated_ids[:] = keys
+
+def _with_dependents(id_data):
+    """An ID plus the animatable IDs the user edits through it."""
+    yield id_data
+    data = getattr(id_data, 'data', None) if getattr(id_data, 'id_type', None) == 'OBJECT' else None
+    if data is not None:
+        yield data
+        keys = getattr(data, 'shape_keys', None)
+        if keys is not None:
+            yield keys
+    for slot in getattr(id_data, 'material_slots', ()):
+        if slot.material is not None:
+            yield slot.material
+            if slot.material.node_tree is not None:
+                yield slot.material.node_tree
+    tree = getattr(id_data, 'node_tree', None)
+    if tree is not None and getattr(id_data, 'id_type', None) in {'LIGHT', 'WORLD'}:
+        yield tree
+
+def _pre_update_candidates(scene):
+    seen = set()
+    view_layer = bpy.context.view_layer
+    roots = list(view_layer.objects.selected)
+    if view_layer.objects.active is not None:
+        roots.append(view_layer.objects.active)
+    roots.append(scene)
+    if scene.world is not None:
+        roots.append(scene.world)
+    for key in _last_updated_ids:
+        id_data = _resolve_key(key)
+        if id_data is not None:
+            roots.append(id_data)
+    for root in roots:
+        for id_data in _with_dependents(root):
+            pointer = id_data.as_pointer()
+            if pointer in seen or getattr(id_data, 'animation_data', None) is None:
+                continue
+            seen.add(pointer)
+            yield id_data
 
 @persistent
-def post_depsgraph_update(scene):
-    _remember_id_counts()
+def post_depsgraph_update(scene, depsgraph=None):
     if not scene.use_anim_offset_mode:
         return
+    # the depsgraph that was just evaluated (with several windows/view layers the context's
+    # depsgraph may not be the one that was updated, and can still hold stale entries)
+    depsgraph = depsgraph or bpy.context.view_layer.depsgraph
+    _remember_updated_ids(depsgraph)
     if g_is_undo_redo_in_progress:
         return
     if scene.tool_settings.use_keyframe_insert_auto:
         return
 
     settings = _get_settings(scene)
-    depsgraph = bpy.context.view_layer.depsgraph
     for id_data in _get_updated_ids(depsgraph):
         for change in get_fcurves_changes(id_data, settings):
             apply_change(id_data, *change, settings)
@@ -889,10 +963,8 @@ def pre_depsgraph_update(scene):
         return
     if g_is_undo_redo_in_progress:
         return
-    if _ids_deleted_since_last_update():
-        return      # depsgraph.updates may point to freed IDs: see _id_counts_at_last_update
     depsgraph = bpy.context.view_layer.depsgraph
-    for id_data in _get_updated_ids(depsgraph):
+    for id_data in _pre_update_candidates(scene):     # never depsgraph.updates here, see above
         save_fcurves_data(id_data, depsgraph)
 
 @persistent
@@ -902,7 +974,9 @@ def on_frame_change(scene, depsgraph=None):
 
 @persistent
 def post_frame_change(scene, depsgraph=None):
-    _remember_id_counts()
+    # a frame change re-evaluates every animated ID: candidates for the next edit
+    if scene.use_anim_offset_mode:
+        _remember_updated_ids(depsgraph or bpy.context.view_layer.depsgraph)
 
 @persistent
 def pre_redo_undo(scene):
@@ -952,7 +1026,7 @@ def post_load(none, other_none) -> None:
     _register_message_bus()
     _migrate_legacy_settings()
     reset_runtime_state()
-    _remember_id_counts()
+    _last_updated_ids.clear()
 
 def _redraw_editors(context=None):
     context = context or bpy.context
