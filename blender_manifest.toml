@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "anim_auto_offset"
-version = "1.4.1"
+version = "1.8.0"
 name = "Animation Auto Offset"
 tagline = "Update all keyframes relatively on transform changes"
 maintainer = "Marek Zajac"
@@ -9,7 +9,7 @@ type = "add-on"
 
 website = "https://github.com/marekzajac97/anim-auto-offset"
 
-tags = ["Animation", "Sequencer"]
+tags = ["Animation"]
 
 blender_version_min = "4.4.0"
 
@@ -23,6 +23,7 @@ paths_exclude_pattern = [
   "__pycache__/",
   "/.vscode/",
   "/img/",
+  "/tests/",
   ".gitignore",
   "README.md",
   "*.zip"
