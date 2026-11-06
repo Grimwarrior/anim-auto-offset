@@ -838,8 +838,36 @@ def _get_updated_ids(depsgraph):
             continue
         yield id_data
 
+# In depsgraph_update_pre, depsgraph.updates lists the IDs tagged for the coming evaluation (that
+# is how the edited ID is found before its new value is applied). But the depsgraph is only
+# rebuilt during that evaluation, so if IDs were deleted since the last update (Outliner delete,
+# purge, a script removing objects) their entries still point to freed memory, and reading them
+# crashes Blender. Deletions are detected by comparing the number of data-blocks of each type
+# with the last update; in that case the pre-update snapshot is skipped once. That update is the
+# deletion itself, so there is no user edit to offset in it.
+_ID_COLLECTION_NAMES = None
+_id_counts_at_last_update = None
+
+def _id_counts():
+    global _ID_COLLECTION_NAMES
+    if _ID_COLLECTION_NAMES is None:
+        _ID_COLLECTION_NAMES = tuple(
+            prop.identifier for prop in bpy.types.BlendData.bl_rna.properties
+            if prop.type == 'COLLECTION' and prop.identifier not in {'window_managers', 'workspaces', 'screens'})
+    return tuple(len(getattr(bpy.data, name)) for name in _ID_COLLECTION_NAMES)
+
+def _remember_id_counts():
+    global _id_counts_at_last_update
+    _id_counts_at_last_update = _id_counts()
+
+def _ids_deleted_since_last_update():
+    if _id_counts_at_last_update is None:
+        return True
+    return any(now < before for now, before in zip(_id_counts(), _id_counts_at_last_update))
+
 @persistent
 def post_depsgraph_update(scene):
+    _remember_id_counts()
     if not scene.use_anim_offset_mode:
         return
     if g_is_undo_redo_in_progress:
@@ -861,6 +889,8 @@ def pre_depsgraph_update(scene):
         return
     if g_is_undo_redo_in_progress:
         return
+    if _ids_deleted_since_last_update():
+        return      # depsgraph.updates may point to freed IDs: see _id_counts_at_last_update
     depsgraph = bpy.context.view_layer.depsgraph
     for id_data in _get_updated_ids(depsgraph):
         save_fcurves_data(id_data, depsgraph)
@@ -869,6 +899,10 @@ def pre_depsgraph_update(scene):
 def on_frame_change(scene, depsgraph=None):
     # animation overwrites property values, this is not a user edit
     reset_runtime_state()
+
+@persistent
+def post_frame_change(scene, depsgraph=None):
+    _remember_id_counts()
 
 @persistent
 def pre_redo_undo(scene):
@@ -918,6 +952,7 @@ def post_load(none, other_none) -> None:
     _register_message_bus()
     _migrate_legacy_settings()
     reset_runtime_state()
+    _remember_id_counts()
 
 def _redraw_editors(context=None):
     context = context or bpy.context
@@ -1506,6 +1541,7 @@ def register():
     bpy.app.handlers.depsgraph_update_post.append(post_depsgraph_update)
     bpy.app.handlers.depsgraph_update_pre.append(pre_depsgraph_update)
     bpy.app.handlers.frame_change_pre.append(on_frame_change)
+    bpy.app.handlers.frame_change_post.append(post_frame_change)
     bpy.app.handlers.undo_post.append(post_redo_undo)
     bpy.app.handlers.redo_post.append(post_redo_undo)
     bpy.app.handlers.undo_pre.append(pre_redo_undo)
@@ -1525,6 +1561,7 @@ def unregister():
     bpy.app.handlers.redo_post.remove(post_redo_undo)
     bpy.app.handlers.undo_post.remove(post_redo_undo)
     bpy.app.handlers.frame_change_pre.remove(on_frame_change)
+    bpy.app.handlers.frame_change_post.remove(post_frame_change)
     bpy.app.handlers.depsgraph_update_pre.remove(pre_depsgraph_update)
     bpy.app.handlers.depsgraph_update_post.remove(post_depsgraph_update)
     bpy.types.DOPESHEET_HT_header.remove(draw_header)

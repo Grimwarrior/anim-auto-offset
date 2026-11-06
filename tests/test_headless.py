@@ -761,6 +761,39 @@ ob.location.x = 9.0
 update()
 check('property edit still offsets after a graph editor edit', approx(keys(ob, 'location', 0), [0, 9, 10]), keys(ob, 'location', 0))
 
+# ---------------------------------------------------------------- deleting animated objects
+# The depsgraph_update_pre handler used to read depsgraph.updates, which before an update still
+# describes the previous evaluation: after deleting just-edited objects (Outliner delete) it read
+# freed IDs and crashed Blender. Deleting must be safe, and the next edit must still be offset.
+s = reset()
+victims = []
+for i in range(60):
+    o = new_cube(f'Victim{i}')
+    for f, x in ((1, 0.0), (10, float(i))):
+        s.frame_set(f); o.location.x = x; o.keyframe_insert('location', index=0, frame=f)
+    if victims:
+        c = o.constraints.new('DAMPED_TRACK'); c.target = victims[-1]
+    victims.append(o)
+keeper = new_cube('Keeper')
+for f, x in ((1, 0.0), (10, 5.0), (20, 10.0)):
+    s.frame_set(f); keeper.location.x = x; keeper.keyframe_insert('location', index=0, frame=f)
+s.frame_set(10)
+update()
+for o in victims:
+    o.location.x += 1.0     # edited: now in the last depsgraph update
+update()
+for o in victims:
+    bpy.data.objects.remove(o, do_unlink=True)
+bpy.data.orphans_purge(do_recursive=True)
+for n in range(3):
+    for k in range(200):
+        bpy.data.meshes.new(f'junk{n}_{k}')    # reuse the freed memory
+    update()
+check('deleting just-edited animated objects does not crash', True)
+keeper.location.x = 6.0
+update()
+check('editing after deleting objects still offsets', approx(keys(keeper, 'location', 0), [1, 6, 11]), keys(keeper, 'location', 0))
+
 bad = sum(1 for _, ok in results if not ok)
 print(f'\n{len(results) - bad}/{len(results)} passed')
 sys.exit(1 if bad else 0)
